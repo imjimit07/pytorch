@@ -22,6 +22,7 @@ from itertools import product
 from unittest.mock import patch
 
 import torch
+import torch.multiprocessing as mp
 import torch.xpu._gpu_trace as gpu_trace
 from torch.testing import make_tensor
 from torch.testing._internal.autocast_test_lists import AutocastTestLists, TestAutocast
@@ -717,6 +718,131 @@ print(torch.xpu.is_initialized())
             "expected stream to be a torch.Stream or torch.xpu.Stream object",
         ):
             e2.wait(e2)
+
+    @unittest.skipIf(not Xe2_Or_Later, "XPU IPC not available")
+    @unittest.skipIf(IS_WINDOWS, "XPU IPC not available on non-Linux platforms")
+    def test_event_ipc_handle(self):
+        if int(torch.version.xpu) < 20260200:
+            with self.assertRaisesRegex(
+                RuntimeError, "XPU IPC events require SYCL compiler 2026.2 or later"
+            ):
+                e0 = torch.xpu.Event(enable_timing=False, interprocess=True)
+                e0.ipc_handle()
+            return
+
+        # IPC and timing cannot both be enabled; error fires at record() time.
+        with self.assertRaisesRegex(
+            RuntimeError, "XPUEvent cannot have both IPC and timing enabled"
+        ):
+            e1 = torch.xpu.Event(enable_timing=True, interprocess=True)
+            e1.record()
+
+        # Same constraint enforced when ipc_handle() triggers lazy initialization.
+        with self.assertRaisesRegex(
+            RuntimeError, "XPUEvent cannot have both IPC and timing enabled"
+        ):
+            e2 = torch.xpu.Event(enable_timing=True, interprocess=True)
+            e2.ipc_handle()
+
+        # ipc_handle() requires interprocess=True.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "XPUEvent ipc_handle\\(\\) requires the event to be constructed with enable_ipc=True",
+        ):
+            e3 = torch.xpu.Event(enable_timing=False, interprocess=False)
+            e3.ipc_handle()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "XPUEvent ipc_handle\\(\\) requires the event to be constructed with enable_ipc=True",
+        ):
+            e4 = torch.xpu.Event(enable_timing=False, interprocess=False)
+            e4.record()
+            e4.ipc_handle()
+
+        # Roundtrip: serialize an in-flight event to a handle and reconstruct it.
+        e5 = torch.xpu.Event(enable_timing=False, interprocess=True)
+        stream = torch.xpu.Stream()
+        with stream:
+            torch.xpu._sleep(500_000_000)  # spin for about 500 ms at 1 GHz
+        e5.record(stream)
+        handle = e5.ipc_handle()
+        e6 = torch.xpu.Event.from_ipc_handle(torch.xpu.current_device(), handle)
+        e5.synchronize()
+        self.assertTrue(e6.query())
+        event_ptr = e6.sycl_event
+        e6.record()
+        self.assertEqual(event_ptr, e6.sycl_event)
+
+        # ipc_handle() cannot be called on the reconstructed event;
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "XPUEvent ipc_handle\\(\\) requires the event to be constructed with enable_ipc=True",
+        ):
+            handle = e6.ipc_handle()
+
+    def test_event_handle_importer(self):
+        e0 = torch.xpu.Event(enable_timing=False, interprocess=True)
+        self.assertTrue(e0.query())
+
+        def _event_handle_importer_consumer(handle, p2c, c2p):
+            e1 = torch.xpu.Event.from_ipc_handle(torch.xpu.current_device(), handle)
+            c2p.put(0)  # notify parent child is ready
+            p2c.get()  # wait for record in parent
+            e1.synchronize()
+            c2p.put(1)  # notify synchronization is done in child
+            p2c.get()  # wait for parent to finish before destructing child event
+
+        ctx = mp.get_context("spawn")
+        p2c = ctx.SimpleQueue()
+        c2p = ctx.SimpleQueue()
+        p = ctx.Process(
+            target=_event_handle_importer_consumer,
+            args=(e0.ipc_handle(), p2c, c2p),
+        )
+        p.start()
+
+        c2p.get()  # wait for child to become ready
+        torch.xpu._sleep(500_000_000)  # spin for about 500 ms
+        e0.record()
+        p2c.put(0)  # notify child event is recorded
+
+        self.assertFalse(e0.query())
+        c2p.get()  # wait for synchronization in child
+        self.assertTrue(e0.query())
+        p2c.put(1)  # notify child that parent is done
+        p.join()
+
+    def test_event_handle_exporter(self):
+        e0 = torch.xpu.Event(enable_timing=False, interprocess=True)
+
+        def _event_handle_exporter_consumer(handle, p2c, c2p):
+            stream = torch.xpu.Stream()
+            with stream:
+                e1 = torch.xpu.Event.from_ipc_handle(torch.xpu.current_device(), handle)
+                torch.xpu._sleep(50_000_000)  # spin for about 500 ms
+                e1.record()
+                c2p.put(0)
+                # wait for parent process finished synchronization before
+                # destructing e1
+                p2c.get()
+
+        ctx = mp.get_context("spawn")
+        p2c = ctx.SimpleQueue()
+        c2p = ctx.SimpleQueue()
+        p = ctx.Process(
+            target=_event_handle_exporter_consumer,
+            args=(e0.ipc_handle(), p2c, c2p),
+        )
+        p.start()
+        # wait for event in child process is recorded
+        c2p.get()
+
+        self.assertFalse(e0.query())
+        e0.synchronize()
+        self.assertTrue(e0.query())
+        p2c.put(0)
+        p.join()
 
     def test_device_context_manager(self):
         prev_device = torch.xpu.current_device()
